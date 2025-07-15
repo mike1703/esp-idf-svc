@@ -1264,6 +1264,67 @@ impl<'b> Connection for EspHttpConnection<'b> {
     }
 }
 
+/// This wraps a `httpd_req_async_handler_begin` call and ensures
+/// that `httpd_req_async_handler_complete` is called when it goes out of scope.
+/// Supported since 5.2
+pub struct AsyncHttpdRequest {
+    // Use NonNull to ensure the pointer is never null.
+    // The inner type `httpd_req_t` is not Send by default in Rust FFI bindings,
+    // but it is safe to be sent across tasks when a request copy is
+    // obtained via `httpd_req_async_handler_begin`.
+    ptr: ptr::NonNull<httpd_req_t>,
+}
+
+// SAFETY:`httpd_req_t*` obtained from `httpd_req_async_handler_begin` can be sent
+// safely between threads as it is a copy of the original request
+// and is not shared with the original request handler.
+unsafe impl Send for AsyncHttpdRequest {}
+
+impl AsyncHttpdRequest {
+    /// Creates a new `AsyncHttpdRequest` by calling `httpd_req_async_handler_begin`.
+    ///
+    /// # Safety
+    /// This function relies on the caller providing a valid `httpd_req_t` pointer.
+    fn from_raw(req: *mut httpd_req_t) -> Result<Self, EspError> {
+        let mut req_copy_ptr: *mut httpd_req_t = ptr::null_mut();
+        // Copy the request data into `req_copy_ptr`
+        esp!(unsafe { httpd_req_async_handler_begin(req, &mut req_copy_ptr) })?;
+
+        // ptr::NonNull ensures that the pointer is valid, otherwise return `ESP_FAIL`
+        let req_copy = ptr::NonNull::new(req_copy_ptr)
+            .ok_or_else(|| EspError::from_infallible::<ESP_FAIL>())?;
+
+        Ok(Self { ptr: req_copy })
+    }
+
+    /// Creates a `AsyncHttpdRequest` from an `EspHttpConnection`.
+    /// It copies the entire request context so the original request can return.
+    /// The `Drop` implementation ensures the data is freed again.
+    pub fn from_connection<'a>(conn: &mut EspHttpConnection<'a>) -> Result<Self, EspError> {
+        // Retrieving the request context from a connection ensures that this is points
+        // to valid data
+        let req_ptr = conn.request.handle();
+        Self::from_raw(req_ptr)
+    }
+
+    /// Creates a `EspHttpConnection` from the copied request context.
+    pub fn as_esp_http_connection<'a>(&mut self) -> Result<EspHttpConnection<'a>, EspError> {
+        // SAFETY: We assume `self.ptr` is a by construction a valid pointer
+        // obtained from `httpd_req_async_handler_begin`.
+        Ok(EspHttpConnection::new(unsafe { self.ptr.as_mut() }))
+    }
+}
+
+impl Drop for AsyncHttpdRequest {
+    fn drop(&mut self) {
+        // SAFETY: We assume `self.ptr` is a valid pointer by construction obtained
+        // from `httpd_req_async_handler_begin` and not yet completed.
+        // This ensures `httpd_req_async_handler_complete` is called exactly once.
+        esp!(unsafe { httpd_req_async_handler_complete(self.ptr.as_ptr()) })
+            .expect("Failed to complete AsyncHttpdRequest on drop");
+    }
+}
+
 #[cfg(esp_idf_httpd_ws_support)]
 pub mod ws {
     use core::ffi;
