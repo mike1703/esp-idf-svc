@@ -42,6 +42,7 @@ use core::net::Ipv6Addr;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::*;
 use core::{ffi, ptr};
+use std::thread;
 
 extern crate alloc;
 use alloc::borrow::ToOwned;
@@ -301,9 +302,41 @@ static CLOSE_HANDLERS: Mutex<BTreeMap<u32, Vec<CloseHandler<'static>>>> =
 type NativeHandler<'a> = Box<dyn Fn(*mut httpd_req_t) -> ffi::c_int + 'a>;
 type CloseHandler<'a> = Box<dyn Fn(ffi::c_int) + Send + 'a>;
 
+pub struct HandlerConfig {
+    /// if true, a thread with `stack_size` will be spawned to handle the connection
+    r#async: bool,
+    /// this stack size is used for the worker thread
+    stack_size: Option<usize>,
+}
+
+impl Default for HandlerConfig {
+    fn default() -> HandlerConfig {
+        HandlerConfig::sync()
+    }
+}
+
+impl HandlerConfig {
+    /// A synchronous handler configuration.
+    pub fn sync() -> HandlerConfig {
+        HandlerConfig {
+            r#async: false,
+            stack_size: None,
+        }
+    }
+
+    /// An asynchronous handler configuration.
+    pub fn r#async(stacksize: usize) -> HandlerConfig {
+        HandlerConfig {
+            r#async: true,
+            stack_size: Some(stacksize),
+        }
+    }
+}
+
 pub struct EspHttpServer<'a> {
     sd: httpd_handle_t,
     registrations: Vec<(CString, crate::sys::httpd_uri_t)>,
+    async_workers: Vec<thread::JoinHandle<()>>,
     _reg: PhantomData<&'a ()>,
 }
 
@@ -390,6 +423,7 @@ impl<'a> EspHttpServer<'a> {
         let server = Self {
             sd: handle,
             registrations: Vec::new(),
+            async_workers: Vec::new(),
             _reg: PhantomData,
         };
 
@@ -502,7 +536,7 @@ impl<'a> EspHttpServer<'a> {
     where
         H: for<'r> Handler<EspHttpConnection<'r>> + Send + 'static,
     {
-        unsafe { self.handler_nonstatic(uri, method, handler) }
+        unsafe { self.handler_nonstatic(uri, method, handler, HandlerConfig::default()) }
     }
 
     /// Registers a `Handler` for a URI and a method (GET, POST, etc).
@@ -535,9 +569,10 @@ impl<'a> EspHttpServer<'a> {
         uri: &str,
         method: Method,
         handler: H,
+        handler_config: HandlerConfig,
     ) -> Result<&mut Self, EspError>
     where
-        H: for<'r> Handler<EspHttpConnection<'r>> + Send + 'a,
+        H: for<'r> Handler<EspHttpConnection<'r>> + Send + 'static,
     {
         let c_str = to_cstring_arg(uri)?;
 
@@ -545,7 +580,8 @@ impl<'a> EspHttpServer<'a> {
         let conf = httpd_uri_t {
             uri: c_str.as_ptr() as _,
             method: Newtype::<ffi::c_uint>::from(method).0,
-            user_ctx: Box::into_raw(Box::new(self.to_native_handler(handler))) as *mut _,
+            user_ctx: Box::into_raw(Box::new(self.to_native_handler(handler, handler_config)))
+                as *mut _,
             handler: Some(EspHttpServer::handle_req),
             ..Default::default()
         };
@@ -578,7 +614,35 @@ impl<'a> EspHttpServer<'a> {
         F: for<'r> Fn(Request<&mut EspHttpConnection<'r>>) -> Result<(), E> + Send + 'static,
         E: Debug,
     {
-        unsafe { self.fn_handler_nonstatic(uri, method, f) }
+        unsafe { self.fn_handler_nonstatic(uri, method, f, HandlerConfig::default()) }
+    }
+
+    /// Registers a function as the handler for the given URI and HTTP method (GET, POST, etc).
+    ///
+    /// The function will be called every time an HTTP client requests that URI
+    /// (via the appropriate HTTP method), receiving a different `Request` each
+    /// call. The `Request` contains a reference to the underlying `EspHttpConnection`.
+    /// 
+    /// In contrast to fn_handler this copies the request and sends it to a worker thread that
+    /// fully handles the connection.
+    pub fn async_fn_handler<E, F>(
+        &mut self,
+        uri: &str,
+        method: Method,
+        f: F,
+    ) -> Result<&mut Self, EspError>
+    where
+        F: for<'r> Fn(Request<&mut EspHttpConnection<'r>>) -> Result<(), E> + Send + Sync + 'static,
+        E: Debug,
+    {
+        unsafe {
+            self.fn_handler_nonstatic(
+                uri,
+                method,
+                f,
+                HandlerConfig::r#async(10 * 1024), // 10 KiB stack size for async handlers
+            )
+        }
     }
 
     /// Registers a function as the handler for the given URI and HTTP method (GET, POST, etc).
@@ -615,37 +679,99 @@ impl<'a> EspHttpServer<'a> {
         uri: &str,
         method: Method,
         f: F,
+        handler_config: HandlerConfig,
     ) -> Result<&mut Self, EspError>
     where
-        F: for<'r> Fn(Request<&mut EspHttpConnection<'r>>) -> Result<(), E> + Send + 'a,
+        F: for<'r> Fn(Request<&mut EspHttpConnection<'r>>) -> Result<(), E> + Send + 'static,
         E: Debug,
     {
-        self.handler_nonstatic(uri, method, FnHandler::new(f))
+        self.handler_nonstatic(uri, method, FnHandler::new(f), handler_config)
     }
 
-    fn to_native_handler<H>(&self, handler: H) -> NativeHandler<'a>
+    fn to_native_handler<H>(
+        &mut self,
+        handler: H,
+        handler_config: HandlerConfig,
+    ) -> NativeHandler<'a>
+    where
+        H: for<'r> Handler<EspHttpConnection<'a>> + Send + 'static,
+    {
+        if handler_config.r#async {
+            self.to_native_handler_async(handler, handler_config)
+        } else {
+            self.to_native_handler_sync(handler)
+        }
+    }
+
+    fn to_native_handler_sync<H>(&self, handler: H) -> NativeHandler<'a>
     where
         H: for<'r> Handler<EspHttpConnection<'a>> + Send + 'a,
     {
         Box::new(move |raw_req| {
             let mut connection = EspHttpConnection::new(unsafe { raw_req.as_mut().unwrap() });
+            Self::connection_handler(&mut connection, &handler);
+            ESP_OK as _
+        })
+    }
 
-            let result = connection.invoke(&handler);
-
-            match result {
-                Ok(()) => {
-                    if let Err(e) = connection.complete() {
-                        connection.handle_error(e);
-                    }
-                }
-                Err(e) => {
+    /// handle a connection request, complete it and handle errors
+    fn connection_handler<H>(connection: &mut EspHttpConnection<'a>, handler: &H)
+    where
+        H: for<'r> Handler<EspHttpConnection<'a>> + Send + 'a,
+    {
+        let result = connection.invoke(handler);
+        match result {
+            Ok(()) => {
+                if let Err(e) = connection.complete() {
                     connection.handle_error(e);
-                    if let Err(e) = connection.complete() {
-                        connection.handle_error(e);
-                    }
                 }
             }
+            Err(e) => {
+                connection.handle_error(e);
+                if let Err(e) = connection.complete() {
+                    connection.handle_error(e);
+                }
+            }
+        }
+    }
 
+    fn to_native_handler_async<H>(
+        &mut self,
+        handler: H,
+        handler_config: HandlerConfig,
+    ) -> NativeHandler<'a>
+    where
+        H: for<'r> Handler<EspHttpConnection<'a>> + Send + 'static,
+    {
+        let builder = thread::Builder::new().stack_size(
+            handler_config
+                .stack_size
+                .expect("No stack size configured for the async handler"),
+        );
+
+        let (async_request_tx, async_request_rx) = std::sync::mpsc::channel::<AsyncHttpdRequest>();
+        // Spawn a worker thread that will handle the request in a different thread
+        let join_handle = builder
+            .spawn(move || {
+                for mut request_context in async_request_rx {
+                    let mut connection = request_context
+                        .as_esp_http_connection()
+                        .expect("Failed to get EspHttpConnection from AsyncHttpdRequest");
+                    Self::connection_handler(&mut connection, &handler);
+                }
+            })
+            .expect("Failed to spawn async handler thread");
+        self.async_workers.push(join_handle);
+
+        // this is the handler the httpd server calls for a new connection
+        Box::new(move |raw_req| {
+            // copy the request context
+            let request_context =
+                AsyncHttpdRequest::from_raw(raw_req).expect("Failed to create AsyncHttpdRequest");
+            // and send it to the worker thread
+            async_request_tx
+                .send(request_context)
+                .expect("Failed to send AsyncHttpdRequest to async handler");
             ESP_OK as _
         })
     }
@@ -752,14 +878,19 @@ unsafe impl EspHttpTraversableChainNonstatic<'_> for ChainRoot {}
 
 impl<'a, H, N> EspHttpTraversableChain<'a> for NonstaticChain<H, N>
 where
-    H: for<'r> Handler<EspHttpConnection<'r>> + Send + 'a,
+    H: for<'r> Handler<EspHttpConnection<'r>> + Send + 'static,
     N: EspHttpTraversableChain<'a>,
 {
     fn accept(self, server: &mut EspHttpServer<'a>) -> Result<(), EspError> {
         self.0.next.accept(server)?;
 
         unsafe {
-            server.handler_nonstatic(self.0.path, self.0.method, self.0.handler)?;
+            server.handler_nonstatic(
+                self.0.path,
+                self.0.method,
+                self.0.handler,
+                HandlerConfig::default(),
+            )?;
         }
 
         Ok(())
@@ -768,7 +899,7 @@ where
 
 unsafe impl<'a, H, N> EspHttpTraversableChainNonstatic<'a> for NonstaticChain<H, N>
 where
-    H: for<'r> Handler<EspHttpConnection<'r>> + Send + 'a,
+    H: for<'r> Handler<EspHttpConnection<'r>> + Send + 'static,
     N: EspHttpTraversableChain<'a>,
 {
 }
